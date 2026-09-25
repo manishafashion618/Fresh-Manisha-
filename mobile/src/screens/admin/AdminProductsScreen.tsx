@@ -192,10 +192,12 @@ export function AdminProductsScreen() {
               }`}
               detail={
                 <Text style={styles.prices} numberOfLines={1}>
-                  {formatPaise(item.retailPrice)} retail
+                  {/* Only the prices the product is sold at — a retail-only
+                      product has no trade price, and vice versa. */}
+                  {item.retailPrice !== undefined ? `${formatPaise(item.retailPrice)} retail` : null}
                   {item.wholesalePrice !== undefined ? (
                     <Text style={styles.tradePrice}>
-                      {' · '}
+                      {item.retailPrice !== undefined ? ' · ' : ''}
                       {formatPaise(item.wholesalePrice)} trade
                     </Text>
                   ) : null}
@@ -236,7 +238,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md + 2,
     marginTop: spacing.lg,
   },
-  searchInput: { flex: 1, paddingVertical: 10, fontSize: 16, color: colors.text },
+  searchInput: { flex: 1, paddingVertical: spacing.md, fontSize: 16, color: colors.text },
 
   bannerWrap: { paddingHorizontal: spacing.xl },
 

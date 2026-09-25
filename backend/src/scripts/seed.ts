@@ -2,9 +2,11 @@
  * Seeds a workable catalog and the first admin account.
  *
  * Run with: npm run seed
+ * Refuses a non-local database (Atlas/production) unless run as
+ *   npm run seed -- --target=production
  * Safe to re-run — it upserts by natural key rather than wiping the database.
  */
-import { connectDatabase, disconnectDatabase } from '../config/database';
+import { connectScriptDatabase, disconnectDatabase } from '../config/database';
 import { env } from '../config/env';
 import { logger } from '../config/logger';
 import { Category, slugify } from '../models/category.model';
@@ -108,7 +110,7 @@ const PRODUCTS: Array<{
 ];
 
 async function seed(): Promise<void> {
-  await connectDatabase();
+  await connectScriptDatabase();
 
   const categoryIds = new Map<string, string>();
   for (const entry of CATEGORIES) {
@@ -147,15 +149,23 @@ async function seed(): Promise<void> {
   }
   logger.info(`Seeded ${PRODUCTS.length} products`);
 
+  // Phone+OTP login is gone, so the bootstrap admin needs a real credential:
+  // without one, a fresh database has no way into the admin panel at all.
+  const { hashPassword } = await import('../services/password.service');
   const admin = await User.findOneAndUpdate(
-    { phone: env.SEED_ADMIN_PHONE },
+    { email: env.SEED_ADMIN_EMAIL },
     {
       $set: { accountType: 'admin', wholesaleStatus: 'none', isActive: true },
-      $setOnInsert: { name: 'Store Admin' },
+      $setOnInsert: {
+        name: 'Store Admin',
+        passwordHash: await hashPassword(env.SEED_ADMIN_PASSWORD),
+        authProviders: ['password'],
+      },
     },
     { new: true, upsert: true },
   );
-  logger.info(`Admin account ready: ${admin.phone} (sign in with OTP — no password)`);
+  logger.info(`Admin account ready: ${admin.email}`);
+  logger.warn('Sign in with SEED_ADMIN_PASSWORD and change it immediately.');
 
   await disconnectDatabase();
   logger.info('Seed complete.');

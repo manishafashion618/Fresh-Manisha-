@@ -8,6 +8,7 @@ import {
   type SerializedProduct,
 } from '../serializers/product.serializer';
 import { ApiError } from '../utils/ApiError';
+import { isProductVisibleTo } from '../utils/rbac';
 import type { AuthenticatedUser } from '../types';
 
 export interface SerializedCartItem {
@@ -47,8 +48,10 @@ export async function getCart(viewer: AuthenticatedUser): Promise<SerializedCart
 
   for (const item of cart.items) {
     const product = productsById.get(item.productId.toString());
-    // A product deleted or deactivated since it was added is dropped silently.
-    if (!product || !product.isActive) {
+    // A product deleted or deactivated since it was added is dropped silently,
+    // as is one moved out of this viewer's storefront — a retail-only product
+    // has no wholesale price to show a trade buyer, and checkout refuses it.
+    if (!product || !product.isActive || !isProductVisibleTo(product.visibility, viewer)) {
       removedStale = true;
       continue;
     }
@@ -93,7 +96,12 @@ export async function addToCart(
   quantity: number,
 ): Promise<SerializedCart> {
   const product = await productRepository.findById(productId);
-  if (!product || !product.isActive) throw ApiError.notFound('Product not found');
+  // A product the viewer's storefront excludes is a 404 here exactly as it is
+  // on the product detail route — otherwise knowing the id would be enough to
+  // buy a wholesale-only piece at the retail price.
+  if (!product || !product.isActive || !isProductVisibleTo(product.visibility, viewer)) {
+    throw ApiError.notFound('Product not found');
+  }
   if (product.stock === 0) throw ApiError.conflict('This product is out of stock');
 
   const cart = await Cart.findOneAndUpdate(

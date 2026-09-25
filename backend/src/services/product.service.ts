@@ -8,22 +8,17 @@ import {
   type SerializedProduct,
 } from '../serializers/product.serializer';
 import { ApiError } from '../utils/ApiError';
-import { PERMISSIONS } from '../utils/rbac';
+import {
+  needsRetailPrice,
+  needsWholesalePrice,
+  pricingIssues,
+  type PricingIssue,
+} from '../utils/productPricing';
+// Storefront visibility lives in utils/rbac.ts so that the paths which take a
+// product id straight from the client — detail, cart, Buy now, checkout — all
+// answer the question the same way.
+import { PERMISSIONS, isProductVisibleTo, storefrontFor } from '../utils/rbac';
 import type { AuthenticatedUser } from '../types';
-
-/**
- * Which storefront a viewer browses (PRD 4.2 / 4.7).
- *
- * Staff and admin get 'all' so the management list still shows every product
- * whatever its visibility. A pending or rejected wholesale applicant is not an
- * approved buyer, so they see the retail storefront.
- */
-function storefrontFor(viewer?: AuthenticatedUser | null): 'retail' | 'wholesale' | 'all' {
-  if (viewer?.accountType === 'admin' || viewer?.accountType === 'staff') return 'all';
-  return viewer?.accountType === 'wholesale' && viewer.wholesaleStatus === 'approved'
-    ? 'wholesale'
-    : 'retail';
-}
 
 export interface ProductListResult {
   items: SerializedProduct[];
@@ -76,9 +71,7 @@ export async function getProduct(
 
   // Same rule as the list, applied again here: without it a shared link would
   // reach a product the viewer's storefront excludes.
-  const storefront = storefrontFor(viewer);
-  const visibility = product.visibility ?? 'both';
-  if (storefront !== 'all' && visibility !== 'both' && visibility !== storefront) {
+  if (!isProductVisibleTo(product.visibility, viewer)) {
     throw ApiError.notFound('Product not found');
   }
 
@@ -91,13 +84,20 @@ export interface ProductInput {
   description: string;
   category: string;
   images?: string[];
-  retailPrice: number;
-  wholesalePrice: number;
+  /** Required unless the product is wholesale-only. */
+  retailPrice?: number;
+  /** Required unless the product is retail-only. */
+  wholesalePrice?: number;
   stock: number;
   sku?: string;
   tags?: string[];
   isActive?: boolean;
   visibility?: 'both' | 'retail' | 'wholesale';
+}
+
+/** Same status, code and shape as a request-validation failure. */
+function pricingError(issues: PricingIssue[]): ApiError {
+  return new ApiError(422, issues[0].message, 'VALIDATION_ERROR', issues);
 }
 
 async function assertCategoryExists(categoryId: string): Promise<void> {
@@ -118,8 +118,18 @@ export async function createProduct(
     );
   }
 
+  const visibility = input.visibility ?? 'both';
+  const issues = pricingIssues(visibility, input.retailPrice, input.wholesalePrice);
+  if (issues.length > 0) throw pricingError(issues);
+
   await assertCategoryExists(input.category);
-  const product = await productRepository.create(input);
+  // A price for a tier the product is not sold to is dropped, not stored.
+  const product = await productRepository.create({
+    ...input,
+    visibility,
+    retailPrice: needsRetailPrice(visibility) ? input.retailPrice : undefined,
+    wholesalePrice: needsWholesalePrice(visibility) ? input.wholesalePrice : undefined,
+  });
   return serializeProduct(product, actor);
 }
 
@@ -128,14 +138,54 @@ export async function updateProduct(
   input: Partial<ProductInput>,
   actor: AuthenticatedUser,
 ): Promise<SerializedProduct> {
+  const canPrice = actor.permissions.includes(PERMISSIONS.PRODUCT_PRICE_MANAGE);
   const touchesPricing = input.retailPrice !== undefined || input.wholesalePrice !== undefined;
-  if (touchesPricing && !actor.permissions.includes(PERMISSIONS.PRODUCT_PRICE_MANAGE)) {
+  if (touchesPricing && !canPrice) {
     throw ApiError.forbidden('Only an admin can change product pricing.');
+  }
+
+  const existing = await productRepository.findById(id);
+  if (!existing) throw ApiError.notFound('Product not found');
+
+  // Checked against the product as it will be after the update: switching a
+  // retail-only product to "both" needs a wholesale price, whether it arrives
+  // in this request or is already stored.
+  const visibility = input.visibility ?? existing.visibility ?? 'both';
+  const retailPrice = input.retailPrice ?? existing.retailPrice;
+  const wholesalePrice = input.wholesalePrice ?? existing.wholesalePrice;
+  const issues = pricingIssues(visibility, retailPrice, wholesalePrice);
+  if (issues.length > 0) {
+    throw canPrice
+      ? pricingError(issues)
+      : ApiError.forbidden(
+          `${issues[0].message} Only an admin can set prices, so ask an admin to make this change.`,
+        );
   }
 
   if (input.category) await assertCategoryExists(input.category);
 
-  const product = await productRepository.updateById(id, input);
+  const { retailPrice: _retail, wholesalePrice: _wholesale, ...rest } = input;
+  const set = {
+    ...rest,
+    ...(input.retailPrice !== undefined && needsRetailPrice(visibility)
+      ? { retailPrice: input.retailPrice }
+      : {}),
+    ...(input.wholesalePrice !== undefined && needsWholesalePrice(visibility)
+      ? { wholesalePrice: input.wholesalePrice }
+      : {}),
+  };
+  // An admin moving a product to one tier clears the other tier's price, so a
+  // retail-only product holds no wholesale price at all. Staff cannot change
+  // prices, so on their edits a stale price stays stored — the serializer and
+  // effectivePriceFor ignore it either way.
+  const unset = canPrice
+    ? [
+        ...(!needsRetailPrice(visibility) ? ['retailPrice' as const] : []),
+        ...(!needsWholesalePrice(visibility) ? ['wholesalePrice' as const] : []),
+      ]
+    : [];
+
+  const product = await productRepository.updateById(id, set, unset);
   if (!product) throw ApiError.notFound('Product not found');
   return serializeProduct(product, actor);
 }

@@ -1,4 +1,4 @@
-import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
+import { createAsyncThunk, createSlice, isAnyOf, type PayloadAction } from '@reduxjs/toolkit';
 import * as Device from 'expo-device';
 import { authApi } from '../../api/endpoints';
 import { ApiError } from '../../api/client';
@@ -9,9 +9,8 @@ import {
   loadTokens,
   saveTokens,
 } from '../../api/tokenStorage';
-// ⚠️ TEMPORARY DEV AUTH — REMOVE BEFORE PRODUCTION (see src/config/devAuth.ts)
-import { devOtpHintFor, resolveDevSession } from '../../config/devAuth';
 import type { Address, User } from '../../api/types';
+import { googleErrorMessage, signInWithGoogle, signOutGoogle } from '../../services/googleAuth';
 
 /**
  * PRD 8.1 authSlice — current user, phone number, account type and wholesale
@@ -34,28 +33,19 @@ export type AuthIntent =
   | { type: 'addToCart'; productId: string; quantity: number }
   | { type: 'toggleWishlist'; productId: string }
   | { type: 'openTab'; tab: 'Cart' | 'Wishlist' | 'Orders' | 'Account' }
-  | { type: 'checkout' };
+  | { type: 'checkout' }
+  /** A guest who tapped "Buy now" lands on checkout for that product, not the cart. */
+  | { type: 'buyNow'; productId: string; quantity: number };
 
 interface AuthState {
   status: AuthStatus;
   user: User | null;
   /** Set when a gated action bounced to sign-in; replayed on success. */
   pendingIntent: AuthIntent | null;
-  /** Phone awaiting OTP entry, kept so the OTP screen can resend. */
-  pendingPhone: string | null;
+  /** Retail or wholesale, chosen while creating an account. */
   pendingAccountType: 'retail' | 'wholesale';
-  /** Wholesale details typed on the login screen, submitted with the OTP. */
+  /** Wholesale details typed on the signup form, submitted with registration. */
   pendingApplication: { businessName?: string; gstNumber?: string } | null;
-  /** Populated only in development, where the API echoes the OTP back. */
-  devCode: string | null;
-  /**
-   * ⚠️ TEMPORARY DEV AUTH — REMOVE BEFORE PRODUCTION
-   * True only when `sendOtp` could not reach the server and fell back to the
-   * offline bypass. Gates the fake-session path in `verifyOtp` so a reachable
-   * backend always completes the real handshake.
-   */
-  devFallback: boolean;
-  otpExpiresInSeconds: number;
   loading: boolean;
   error: string | null;
 }
@@ -64,12 +54,8 @@ const initialState: AuthState = {
   status: 'booting',
   user: null,
   pendingIntent: null,
-  pendingPhone: null,
   pendingAccountType: 'retail',
   pendingApplication: null,
-  devCode: null,
-  devFallback: false,
-  otpExpiresInSeconds: 0,
   loading: false,
   error: null,
 };
@@ -115,69 +101,105 @@ export const bootstrapSession = createAsyncThunk<User | null>(
   },
 );
 
-export const sendOtp = createAsyncThunk<
-  { phone: string; devCode?: string; expiresInSeconds: number; devFallback: boolean },
-  { phone: string; accountType?: 'retail' | 'wholesale' },
-  { rejectValue: string }
->('auth/sendOtp', async ({ phone }, { rejectWithValue }) => {
-  try {
-    const result = await authApi.sendOtp(phone);
-    // The server issued a real code, so this sign-in must be completed against
-    // the server. devFallback:false is what stops the bypass hijacking it.
-    return {
-      phone,
-      devCode: result.devCode,
-      expiresInSeconds: result.expiresInSeconds,
-      devFallback: false,
-    };
-  } catch (error) {
-    // ⚠️ TEMPORARY DEV AUTH — REMOVE BEFORE PRODUCTION
-    // The real request is always attempted first. Only when it fails AND the
-    // bypass is on do we let the flow continue offline, so the OTP screen is
-    // reachable with no SMS provider and no backend. Delete this block with the
-    // rest of the bypass.
-    const hint = devOtpHintFor(phone);
-    if (hint) return { phone, devCode: hint, expiresInSeconds: 300, devFallback: true };
-
-    return rejectWithValue(messageFor(error));
-  }
-});
-
-export const verifyOtp = createAsyncThunk<
+/**
+ * Email + password credentials.
+ *
+ * Both sign-in routes persist tokens through `saveTokens`, so they land in
+ * the same session state.
+ */
+export const registerWithPassword = createAsyncThunk<
   User,
-  {
-    phone: string;
-    code: string;
-    accountType?: 'retail' | 'wholesale';
-    application?: { businessName?: string; gstNumber?: string };
-  },
-  { state: { auth: AuthState }; rejectValue: string }
->('auth/verifyOtp', async (input, { getState, rejectWithValue }) => {
-  // ⚠️ TEMPORARY DEV AUTH — REMOVE BEFORE PRODUCTION
-  // Additive only: returns null unless DEV_AUTH_BYPASS is on AND the pair
-  // matches a dev rule, in which case we never reach the real API. Delete this
-  // block and the devAuth import to remove the feature entirely.
-  //
-  // Gated on devFallback: the bypass mints a fake JWT the real server rejects,
-  // so taking it after the server issued a genuine OTP produced a session that
-  // "succeeded" and was then torn down by the first 401 — bouncing the user
-  // back to sign in and forcing a second, real login. It may only run when the
-  // send actually fell back to offline mode.
-  if (getState().auth.devFallback) {
-    const devSession = resolveDevSession(input.phone, input.code);
-    if (devSession) {
-      await saveTokens(devSession.accessToken, devSession.refreshToken);
-      return devSession.user;
-    }
-  }
-
+  { email: string; password: string; name?: string; accountType?: 'retail' | 'wholesale' },
+  { rejectValue: string }
+>('auth/registerWithPassword', async (input, { rejectWithValue }) => {
   try {
-    const result = await authApi.verifyOtp({
+    const result = await authApi.register({
       ...input,
       deviceId: Device.osInternalBuildId ?? Device.modelId ?? undefined,
     });
     await saveTokens(result.accessToken, result.refreshToken);
     return result.user;
+  } catch (error) {
+    return rejectWithValue(messageFor(error));
+  }
+});
+
+export const loginWithPassword = createAsyncThunk<
+  User,
+  { email: string; password: string },
+  { rejectValue: string }
+>('auth/loginWithPassword', async (input, { rejectWithValue }) => {
+  try {
+    const result = await authApi.login({
+      ...input,
+      deviceId: Device.osInternalBuildId ?? Device.modelId ?? undefined,
+    });
+    await saveTokens(result.accessToken, result.refreshToken);
+    return result.user;
+  } catch (error) {
+    return rejectWithValue(messageFor(error));
+  }
+});
+
+/**
+ * Native Google sign-in, then the same token exchange and session path as a
+ * password login. Resolves with `null` when the user closed the picker — that
+ * is a normal choice, not an error, and leaves the state untouched.
+ */
+export const loginWithGoogle = createAsyncThunk<User | null, void, { rejectValue: string }>(
+  'auth/loginWithGoogle',
+  async (_, { rejectWithValue }) => {
+    try {
+      const idToken = await signInWithGoogle();
+      if (!idToken) return null;
+      const result = await authApi.google({
+        idToken,
+        deviceId: Device.osInternalBuildId ?? Device.modelId ?? undefined,
+      });
+      await saveTokens(result.accessToken, result.refreshToken);
+      return result.user;
+    } catch (error) {
+      // Signed in on the device but refused by the API: forget the Google
+      // account too, so the next attempt shows the picker again.
+      await signOutGoogle();
+      return rejectWithValue(googleErrorMessage(error));
+    }
+  },
+);
+
+export const requestPasswordReset = createAsyncThunk<string, string, { rejectValue: string }>(
+  'auth/requestPasswordReset',
+  async (email, { rejectWithValue }) => {
+    try {
+      const result = await authApi.forgotPassword(email);
+      return result.message;
+    } catch (error) {
+      return rejectWithValue(messageFor(error));
+    }
+  },
+);
+
+export const verifyResetOtp = createAsyncThunk<
+  { resetToken: string },
+  { email: string; otp: string },
+  { rejectValue: string }
+>('auth/verifyResetOtp', async (input, { rejectWithValue }) => {
+  try {
+    const result = await authApi.verifyResetOtp(input);
+    return { resetToken: result.resetToken };
+  } catch (error) {
+    return rejectWithValue(messageFor(error));
+  }
+});
+
+export const submitPasswordReset = createAsyncThunk<
+  string,
+  { token: string; password: string },
+  { rejectValue: string }
+>('auth/submitPasswordReset', async (input, { rejectWithValue }) => {
+  try {
+    const result = await authApi.resetPassword(input);
+    return result.message;
   } catch (error) {
     return rejectWithValue(messageFor(error));
   }
@@ -194,6 +216,8 @@ export const signOut = createAsyncThunk('auth/signOut', async () => {
     await authApi.logout(refreshToken).catch(() => undefined);
   }
   await clearTokens();
+  // So the account picker appears again next time; never blocks sign-out.
+  await signOutGoogle();
 });
 
 export const applyForWholesale = createAsyncThunk<
@@ -260,13 +284,6 @@ const authSlice = createSlice({
     clearError(state) {
       state.error = null;
     },
-    resetOtpFlow(state) {
-      state.pendingPhone = null;
-      state.devCode = null;
-      state.devFallback = false;
-      state.otpExpiresInSeconds = 0;
-      state.error = null;
-    },
     setPendingAccountType(state, action: PayloadAction<'retail' | 'wholesale'>) {
       state.pendingAccountType = action.payload;
     },
@@ -291,39 +308,6 @@ const authSlice = createSlice({
         state.user = null;
       })
 
-      .addCase(sendOtp.pending, (state) => {
-        state.loading = true;
-        state.error = null;
-      })
-      .addCase(sendOtp.fulfilled, (state, action) => {
-        state.loading = false;
-        state.pendingPhone = action.payload.phone;
-        state.devCode = action.payload.devCode ?? null;
-        state.devFallback = action.payload.devFallback;
-        state.otpExpiresInSeconds = action.payload.expiresInSeconds;
-      })
-      .addCase(sendOtp.rejected, (state, action) => {
-        state.loading = false;
-        state.error = action.payload ?? 'Could not send the code.';
-      })
-
-      .addCase(verifyOtp.pending, (state) => {
-        state.loading = true;
-        state.error = null;
-      })
-      .addCase(verifyOtp.fulfilled, (state, action) => {
-        state.loading = false;
-        state.user = action.payload;
-        state.status = 'signedIn';
-        state.pendingPhone = null;
-        state.devCode = null;
-        state.pendingApplication = null;
-      })
-      .addCase(verifyOtp.rejected, (state, action) => {
-        state.loading = false;
-        state.error = action.payload ?? 'Could not verify the code.';
-      })
-
       .addCase(refreshProfile.fulfilled, (state, action) => {
         state.user = action.payload;
       })
@@ -332,8 +316,22 @@ const authSlice = createSlice({
         state.status = 'guest';
         state.pendingIntent = null;
         state.user = null;
-        state.pendingPhone = null;
+          state.error = null;
+      })
+
+      // Google has its own spinner on its own button, so it leaves the shared
+      // `loading` flag (which drives the email button) alone.
+      .addCase(loginWithGoogle.pending, (state) => {
         state.error = null;
+      })
+      .addCase(loginWithGoogle.fulfilled, (state, action) => {
+        if (!action.payload) return;
+        state.user = action.payload;
+        state.status = 'signedIn';
+        state.pendingApplication = null;
+      })
+      .addCase(loginWithGoogle.rejected, (state, action) => {
+        state.error = action.payload ?? "Couldn't sign you in with Google. Please try again.";
       })
 
       .addCase(applyForWholesale.fulfilled, (state, action) => {
@@ -358,7 +356,73 @@ const authSlice = createSlice({
       })
       .addCase(deleteAddress.fulfilled, (state, action) => {
         if (state.user) state.user.addresses = action.payload;
-      });
+      })
+
+      // Registering and signing in land in the same signed-in state, so the
+      // navigator does not need to know which of the two got the user there.
+      .addMatcher(
+        isAnyOf(registerWithPassword.pending, loginWithPassword.pending),
+        (state) => {
+          state.loading = true;
+          state.error = null;
+        },
+      )
+      .addMatcher(
+        isAnyOf(
+          registerWithPassword.fulfilled,
+          loginWithPassword.fulfilled,
+        ),
+        (state, action) => {
+          state.loading = false;
+          state.user = action.payload as User;
+          state.status = 'signedIn';
+          state.pendingApplication = null;
+        },
+      )
+      .addMatcher(
+        isAnyOf(
+          registerWithPassword.rejected,
+          loginWithPassword.rejected,
+        ),
+        (state, action) => {
+          state.loading = false;
+          state.error = (action.payload as string) ?? 'Could not sign you in.';
+        },
+      )
+
+      // Reset requests never change session state — only loading and error.
+      .addMatcher(
+        isAnyOf(
+          requestPasswordReset.pending,
+          verifyResetOtp.pending,
+          submitPasswordReset.pending,
+        ),
+        (state) => {
+          state.loading = true;
+          state.error = null;
+        },
+      )
+      .addMatcher(
+        isAnyOf(
+          requestPasswordReset.fulfilled,
+          verifyResetOtp.fulfilled,
+          submitPasswordReset.fulfilled,
+        ),
+        (state) => {
+          state.loading = false;
+        },
+      )
+      .addMatcher(
+        isAnyOf(
+          requestPasswordReset.rejected,
+          verifyResetOtp.rejected,
+          submitPasswordReset.rejected,
+        ),
+        (state, action) => {
+          state.loading = false;
+          state.error = (action.payload as string) ?? 'Something went wrong.';
+        },
+      );
   },
 });
 
@@ -367,7 +431,6 @@ export const {
   setPendingIntent,
   clearPendingIntent,
   clearError,
-  resetOtpFlow,
   setPendingAccountType,
   setPendingApplication,
 } = authSlice.actions;

@@ -7,8 +7,10 @@ import { User } from '../models/user.model';
 import * as productRepository from '../repositories/product.repository';
 import { effectivePriceFor, priceTierFor } from '../serializers/product.serializer';
 import { ApiError } from '../utils/ApiError';
+import { isProductVisibleTo } from '../utils/rbac';
 import { ORDER_STATUS_TRANSITIONS, type OrderStatus, type PaymentMethod } from '../types';
 import type { AuthenticatedUser } from '../types';
+import * as codService from './cod.service';
 import * as paymentService from './payment.service';
 
 /* ── Serialization ──────────────────────────────────────────────────────── */
@@ -35,6 +37,8 @@ export interface SerializedOrder {
   orderStatus: OrderStatus;
   statusHistory: Array<{ status: OrderStatus; at: string; note?: string }>;
   cancellable: boolean;
+  /** True for a "Buy now" order, so the client knows not to clear its cart. */
+  fromBuyNow: boolean;
   customer?: { id: string; name?: string; phone: string };
   createdAt: string;
   updatedAt: string;
@@ -75,6 +79,7 @@ export function serializeOrder(
     })),
     // PRD 4.5 — cancellable only while still "placed", before processing begins.
     cancellable: order.orderStatus === 'placed',
+    fromBuyNow: order.fromBuyNow ?? false,
     ...(options.includeCustomer && populatedUser && 'phone' in populatedUser
       ? {
           customer: {
@@ -103,6 +108,12 @@ function generateOrderNumber(): string {
 export interface CheckoutInput {
   addressId: string;
   paymentMethod: PaymentMethod;
+  /**
+   * "Buy now" — order this one product instead of the saved cart. The cart is
+   * neither read nor cleared, so a customer holding five items who buys a
+   * single piece pays for that piece alone.
+   */
+  buyNow?: { productId: string; quantity: number };
 }
 
 export interface CheckoutResult {
@@ -116,7 +127,8 @@ export interface CheckoutResult {
  *
  * Prices are read from the product documents at the buyer's tier and frozen
  * onto the order as priceAtOrder (PRD 8.2 price protection). The client never
- * supplies a price or a total.
+ * supplies a price or a total — and, since COD became state-dependent, never
+ * supplies the shipping charge or the state it is derived from either.
  */
 export async function checkout(
   viewer: AuthenticatedUser,
@@ -128,23 +140,43 @@ export async function checkout(
   const address = user.addresses.id(input.addressId);
   if (!address) throw ApiError.badRequest('Select a valid delivery address');
 
-  const cart = await Cart.findOne({ userId: viewer.id });
-  if (!cart || cart.items.length === 0) throw ApiError.badRequest('Your cart is empty');
+  // One order builder, two sources. A Buy-now order skips the cart lookup
+  // entirely rather than reading and ignoring it.
+  const buyNow = input.buyNow;
+  const lines: Array<{ productId: string; quantity: number }> = [];
 
-  const products = await productRepository.findManyByIds(
-    cart.items.map((item) => item.productId.toString()),
-  );
+  if (buyNow) {
+    lines.push({ productId: buyNow.productId, quantity: buyNow.quantity });
+  } else {
+    const cart = await Cart.findOne({ userId: viewer.id });
+    if (!cart || cart.items.length === 0) throw ApiError.badRequest('Your cart is empty');
+    for (const item of cart.items) {
+      lines.push({ productId: item.productId.toString(), quantity: item.quantity });
+    }
+  }
+
+  const products = await productRepository.findManyByIds(lines.map((line) => line.productId));
   const productsById = new Map(products.map((product) => [product._id.toString(), product]));
 
   const items: IOrderItem[] = [];
-  for (const cartItem of cart.items) {
-    const product = productsById.get(cartItem.productId.toString());
-    if (!product || !product.isActive) {
-      throw ApiError.conflict('An item in your cart is no longer available. Please review your cart.');
-    }
-    if (product.stock < cartItem.quantity) {
+  for (const line of lines) {
+    const product = productsById.get(line.productId);
+    // Visibility is checked here as well as at add-to-cart: this is the last
+    // point before money, and a Buy-now line never passed through the cart at
+    // all. Without it the product id alone would be enough to order a piece the
+    // buyer's storefront excludes, at their own tier's price.
+    if (!product || !product.isActive || !isProductVisibleTo(product.visibility, viewer)) {
       throw ApiError.conflict(
-        `"${product.name}" only has ${product.stock} left. Please update your cart.`,
+        buyNow
+          ? 'This product is no longer available.'
+          : 'An item in your cart is no longer available. Please review your cart.',
+      );
+    }
+    if (product.stock < line.quantity) {
+      throw ApiError.conflict(
+        buyNow
+          ? `"${product.name}" only has ${product.stock} left.`
+          : `"${product.name}" only has ${product.stock} left. Please update your cart.`,
       );
     }
 
@@ -152,14 +184,19 @@ export async function checkout(
       productId: product._id,
       name: product.name,
       image: product.images[0],
-      quantity: cartItem.quantity,
+      quantity: line.quantity,
       priceAtOrder: effectivePriceFor(product, viewer),
       priceTier: priceTierFor(viewer),
     });
   }
 
   const subtotal = items.reduce((sum, item) => sum + item.priceAtOrder * item.quantity, 0);
-  const shippingCharge = paymentService.shippingChargeFor(input.paymentMethod);
+  // Shipping is priced from the *saved* address's state, never from anything
+  // the client sent: the request carries an address id and a payment method
+  // and nothing else, so a COD charge cannot be lowered and COD cannot be
+  // forced in a state where the store has switched it off. A disabled state
+  // throws COD_UNAVAILABLE here, before any stock is reserved.
+  const { shippingCharge } = await codService.resolveShipping(input.paymentMethod, address.state);
   const totalAmount = subtotal + shippingCharge;
 
   // Reserve stock before creating the order so two concurrent checkouts cannot
@@ -195,6 +232,7 @@ export async function checkout(
       currency: env.CURRENCY,
       orderStatus: 'placed',
       statusHistory: [{ status: 'placed', at: new Date() }],
+      fromBuyNow: Boolean(buyNow),
     });
 
     if (input.paymentMethod === 'razorpay') {
@@ -206,7 +244,8 @@ export async function checkout(
       return { order: serializeOrder(order), payment: handle };
     }
 
-    await Cart.updateOne({ userId: viewer.id }, { $set: { items: [] } });
+    // Only a cart checkout empties the cart. A Buy-now order never read it.
+    if (!buyNow) await Cart.updateOne({ userId: viewer.id }, { $set: { items: [] } });
     return { order: serializeOrder(order) };
   } catch (error) {
     for (const entry of reserved) {
@@ -250,7 +289,11 @@ export async function confirmPayment(
   order.payment.paidAt = new Date();
   await order.save();
 
-  await Cart.updateOne({ userId: viewer.id }, { $set: { items: [] } });
+  // A Buy-now order was never built from the cart, so clearing it here would
+  // silently delete items the customer has not checked out.
+  if (!order.fromBuyNow) {
+    await Cart.updateOne({ userId: viewer.id }, { $set: { items: [] } });
+  }
 
   return serializeOrder(order);
 }
@@ -282,7 +325,10 @@ export async function handlePaymentWebhook(event: {
       paidAt: new Date(),
     };
     await order.save();
-    await Cart.updateOne({ userId: order.userId }, { $set: { items: [] } });
+    // Same rule as confirmPayment: a Buy-now order leaves the cart alone.
+    if (!order.fromBuyNow) {
+      await Cart.updateOne({ userId: order.userId }, { $set: { items: [] } });
+    }
     return;
   }
 
@@ -302,7 +348,19 @@ export async function handlePaymentWebhook(event: {
   }
 }
 
+/**
+ * Credits this order's stock back, at most once.
+ *
+ * The customer, the store and the payment.failed webhook can all cancel the
+ * same order — a customer who cancels a pending online payment still gets the
+ * webhook afterwards — so without the marker the pieces would be counted back
+ * in twice and the catalogue would claim stock it does not have. The caller
+ * saves the order; setting the marker here keeps every path honest.
+ */
 async function releaseStock(order: IOrder): Promise<void> {
+  if (order.stockReleasedAt) return;
+  order.stockReleasedAt = new Date();
+
   for (const item of order.items) {
     await productRepository.incrementStock(item.productId.toString(), item.quantity);
   }
@@ -343,7 +401,13 @@ export async function listAllOrders(filters: {
 }) {
   const query: Record<string, unknown> = {};
   if (filters.status) query.orderStatus = filters.status;
-  if (filters.search) query.orderNumber = new RegExp(filters.search.trim(), 'i');
+  if (filters.search) {
+    // Escaped, not interpolated: an order number typed with a bracket or a
+    // paren would otherwise be compiled as a pattern — a syntax error becomes a
+    // 500, and a pathological one becomes a slow scan.
+    const escaped = filters.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.orderNumber = new RegExp(escaped, 'i');
+  }
 
   const skip = (filters.page - 1) * filters.limit;
   const [orders, total] = await Promise.all([

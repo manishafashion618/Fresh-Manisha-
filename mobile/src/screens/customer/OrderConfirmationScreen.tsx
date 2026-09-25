@@ -3,11 +3,11 @@ import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
 import { useNavigation, useRoute, type RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { Button, Screen } from '../../components/ui';
+import { Button, EmptyState, Group, Row, Screen } from '../../components/ui';
 import { BlockSkeleton } from '../../components/motion';
 import { Icon } from '../../components/Icon';
 import { orderApi } from '../../api/endpoints';
-import { colors, radius, shadow, shadowAccent, spacing, typography } from '../../theme';
+import { colors, radius, shadowAccent, spacing, typography } from '../../theme';
 import { formatPaise } from '../../utils/money';
 import type { RootStackParamList } from '../../navigation/types';
 import type { Order } from '../../api/types';
@@ -23,13 +23,48 @@ export function OrderConfirmationScreen() {
   const navigation = useNavigation<Nav>();
   const { params } = useRoute<Route>();
   const [order, setOrder] = useState<Order | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
+
     orderApi
       .detail(params.orderId)
-      .then(setOrder)
-      .catch(() => setOrder(null));
+      .then((result) => {
+        if (!cancelled) setOrder(result);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [params.orderId]);
+
+  /* The order exists — the customer has already paid or committed to COD by the
+     time this screen opens. Failing to read it back is a display problem, not a
+     payment one, so it says the order is placed and offers the orders list.
+     Falling through to the skeleton instead would strand someone who has just
+     paid on a screen that never resolves. */
+  if (failed) {
+    return (
+      <Screen edges={['top', 'bottom']}>
+        <EmptyState
+          icon="info"
+          title="Order placed"
+          message="We could not load the details just now. You'll find this order under My orders."
+          action={
+            <Button
+              label="Go to my orders"
+              onPress={() => navigation.replace('CustomerTabs', { screen: 'Orders' })}
+              fullWidth={false}
+            />
+          }
+        />
+      </Screen>
+    );
+  }
 
   if (!order) {
     return (
@@ -57,30 +92,29 @@ export function OrderConfirmationScreen() {
           </Text>
         </View>
 
-        <View style={[styles.card, shadow]}>
-          <DetailRow label="Order" value={order.orderNumber} strong />
-          <DetailRow
+        {/* Group + Row rather than a local DetailRow: this was the last screen
+            rebuilding a grouped list by hand. Group draws the hairlines, so the
+            per-row `divided` flag is gone with it. */}
+        <Group style={styles.card}>
+          <Row label="Order" value={order.orderNumber} />
+          <Row
             label={order.paymentStatus === 'paid' ? 'Paid' : 'Payable'}
             value={`${formatPaise(order.totalAmount)} · ${
               order.paymentMethod === 'cod' ? 'On delivery' : 'Online'
             }`}
-            strong
-            divided
           />
-          <DetailRow
+          <Row
             label="Delivery to"
             value={`${order.shippingAddress.city}, ${order.shippingAddress.pincode}`}
-            divided
           />
-          <DetailRow
+          <Row
             label="Placed"
             value={new Date(order.createdAt).toLocaleDateString('en-IN', {
               day: 'numeric',
               month: 'short',
             })}
-            divided
           />
-        </View>
+        </Group>
 
         <View style={styles.thumbRow}>
           {thumbs.map((item, index) => (
@@ -113,25 +147,6 @@ export function OrderConfirmationScreen() {
   );
 }
 
-function DetailRow({
-  label,
-  value,
-  strong = false,
-  divided = false,
-}: {
-  label: string;
-  value: string;
-  strong?: boolean;
-  divided?: boolean;
-}) {
-  return (
-    <View style={[styles.detailRow, divided && styles.detailDivided]}>
-      <Text style={styles.detailLabel}>{label}</Text>
-      <Text style={[styles.detailValue, strong && styles.detailValueStrong]}>{value}</Text>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   scroll: { paddingBottom: spacing.xl },
   hero: { alignItems: 'center', paddingHorizontal: spacing.xl, paddingTop: 72 },
@@ -153,18 +168,7 @@ const styles = StyleSheet.create({
     maxWidth: 300,
   },
 
-  card: {
-    marginHorizontal: spacing.xl,
-    marginTop: spacing.xxl,
-    paddingHorizontal: spacing.xl,
-    borderRadius: radius.lg,
-    backgroundColor: colors.surface,
-  },
-  detailRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 15 },
-  detailDivided: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
-  detailLabel: { ...typography.callout, color: colors.textMuted },
-  detailValue: { ...typography.calloutStrong, color: colors.text },
-  detailValueStrong: { fontWeight: '600' },
+  card: { marginHorizontal: spacing.xl, marginTop: spacing.xxl },
 
   thumbRow: {
     flexDirection: 'row',

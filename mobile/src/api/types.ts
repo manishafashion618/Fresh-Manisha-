@@ -41,11 +41,18 @@ export interface Address {
   isDefault: boolean;
 }
 
+export type AuthProvider = 'otp' | 'password' | 'google';
+
 export interface User {
   id: string;
-  phone: string;
+  /** Absent on Google-only accounts, which never supply a number. */
+  phone?: string;
+  /** Credentials this account can sign in with. */
+  authProviders: AuthProvider[];
   name?: string;
   email?: string;
+  /** Profile photo; set from Google on accounts that signed in with it. */
+  avatar?: string;
   accountType: AccountType;
   wholesaleStatus: WholesaleStatus;
   business?: {
@@ -87,8 +94,12 @@ export interface Product {
   /** Price for the signed-in account's tier, in paise. */
   price: number;
   priceTier: PriceTier;
-  retailPrice: number;
-  /** Only present for approved wholesale accounts, staff and admin. */
+  /** Absent on a wholesale-only product. */
+  retailPrice?: number;
+  /**
+   * Only present for approved wholesale accounts, staff and admin, and only on
+   * a product sold to wholesale buyers.
+   */
   wholesalePrice?: number;
   stock: number;
   inStock: boolean;
@@ -144,6 +155,12 @@ export interface Order {
   orderStatus: OrderStatus;
   statusHistory: Array<{ status: OrderStatus; at: string; note?: string }>;
   cancellable: boolean;
+  /**
+   * True for a "Buy now" order. The server built it from one product rather
+   * than the cart and left the cart intact, so the client must not clear its
+   * local copy when this order is placed or paid for.
+   */
+  fromBuyNow: boolean;
   customer?: { id: string; name?: string; phone: string };
   createdAt: string;
   updatedAt: string;

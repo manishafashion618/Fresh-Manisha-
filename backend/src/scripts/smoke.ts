@@ -10,6 +10,7 @@
  *   - approval unlocking wholesale pricing (4.7)
  *   - staff blocked from changing prices, admin allowed (8.9)
  *   - COD checkout with flat shipping + price-at-order (4.3 / 4.4 / 8.2)
+ *   - "Buy now": a single-product order that leaves the saved cart intact
  *   - cancel-while-placed and stock restoration (4.5)
  *   - refresh-token rotation and reuse rejection (8.7 / 8.10)
  *
@@ -46,20 +47,19 @@ async function main(): Promise<void> {
   process.env.API_PREFIX = '/api/v1';
   process.env.JWT_ACCESS_SECRET = 'smoke-test-access-secret-value-0123456789';
   process.env.JWT_REFRESH_SECRET = 'smoke-test-refresh-secret-value-0123456789';
-  process.env.OTP_PROVIDER = 'console';
   process.env.COD_SHIPPING_CHARGE = '5000';
   process.env.PREPAID_SHIPPING_CHARGE = '0';
   process.env.RATE_LIMIT_GENERAL_PER_MIN = '10000';
 
   const { createApp } = await import('../app');
-  const { connectDatabase, disconnectDatabase } = await import('../config/database');
+  const { connectScriptDatabase, disconnectDatabase } = await import('../config/database');
   const { initStore } = await import('../config/store');
   const { User } = await import('../models/user.model');
   const { Category } = await import('../models/category.model');
   const { Product } = await import('../models/product.model');
 
   initStore();
-  await connectDatabase();
+  await connectScriptDatabase();
 
   const app = createApp();
   const server: Server = await new Promise((resolve) => {
@@ -90,20 +90,37 @@ async function main(): Promise<void> {
     return { status: response.status, body: body as ApiResponse['body'] };
   }
 
-  /** Full OTP round trip; devCode is returned outside production. */
+  /**
+   * Registers a throwaway email/password account and returns its session plus
+   * the credentials, so a caller that changes the role can sign in again and
+   * pick the change up. Phone+OTP login was removed; these scripts no longer
+   * have a number to key on.
+   */
   async function login(
-    phone: string,
+    label: string,
     accountType: 'retail' | 'wholesale' = 'retail',
-  ): Promise<{ accessToken: string; refreshToken: string; user: any }> {
-    const sent = await call('POST', '/auth/otp/send', { body: { phone } });
-    const code = sent.body.data?.devCode;
-    const verified = await call('POST', '/auth/otp/verify', {
-      body: { phone, code, accountType },
+  ): Promise<{ accessToken: string; refreshToken: string; user: any; email: string; password: string }> {
+    const email = `${label.replace(/[^a-z0-9]/gi, '').toLowerCase()}.${Date.now()}@example.test`;
+    const password = 'SmokeTest123';
+    const registered = await call('POST', '/auth/register', {
+      body: { email, password, accountType },
     });
-    if (!verified.body.data?.accessToken) {
-      throw new Error(`Login failed for ${phone}: ${JSON.stringify(verified.body)}`);
+    if (!registered.body.data?.accessToken) {
+      throw new Error(`Registration failed for ${email}: ${JSON.stringify(registered.body)}`);
     }
-    return verified.body.data;
+    return { ...registered.body.data, email, password };
+  }
+
+  /** Signs an existing account back in — used after a role change. */
+  async function reLogin(
+    email: string,
+    password: string,
+  ): Promise<{ accessToken: string; refreshToken: string; user: any }> {
+    const res = await call('POST', '/auth/login', { body: { email, password } });
+    if (!res.body.data?.accessToken) {
+      throw new Error(`Login failed for ${email}: ${JSON.stringify(res.body)}`);
+    }
+    return res.body.data;
   }
 
   try {
@@ -113,21 +130,23 @@ async function main(): Promise<void> {
     check('health returns 200 with database connected', health.status === 200, health.body);
 
     /* ── Auth ─────────────────────────────────────────────────────────── */
-    section('Authentication (PRD 4.1 / 8.7)');
+    section('Authentication (email + password)');
 
-    const badVerify = await call('POST', '/auth/otp/verify', {
-      body: { phone: '+919000000001', code: '000000' },
+    const badLogin = await call('POST', '/auth/login', {
+      body: { email: 'nobody@example.test', password: 'WrongPass123' },
     });
     check(
-      'wrong/expired OTP returns 401, not 200',
-      badVerify.status === 401,
-      { status: badVerify.status, body: badVerify.body },
+      'unknown email returns 401, not 200',
+      badLogin.status === 401,
+      { status: badLogin.status, body: badLogin.body },
     );
 
-    const sendResult = await call('POST', '/auth/otp/send', { body: { phone: '9812345670' } });
-    check('bare 10-digit number is accepted and normalised', sendResult.status === 200);
+    const forgot = await call('POST', '/auth/forgot-password', {
+      body: { email: 'nobody@example.test' },
+    });
+    check('forgot-password is generic for unknown emails', forgot.status === 200);
 
-    const retail = await login('+919812345671', 'retail');
+    const retail = await login('user9812345671', 'retail');
     check('retail signup issues an access token', Boolean(retail.accessToken));
     check('retail account type is retail', retail.user.accountType === 'retail', retail.user);
 
@@ -144,13 +163,9 @@ async function main(): Promise<void> {
     /* ── Admin + catalog ──────────────────────────────────────────────── */
     section('Catalog & price visibility (PRD 4.2 / 8.4)');
 
-    await User.updateOne({ phone: '+919999999901' }, { $set: { accountType: 'admin' } }, { upsert: true });
-    const adminUser = await User.findOne({ phone: '+919999999901' });
-    if (adminUser) {
-      adminUser.accountType = 'admin';
-      await adminUser.save();
-    }
-    const admin = await login('+919999999901');
+    const adminSeed = await login('admin');
+    await User.updateOne({ email: adminSeed.email }, { $set: { accountType: 'admin' } });
+    const admin = await reLogin(adminSeed.email, adminSeed.password);
     check('admin routed by accountType', admin.user.accountType === 'admin', admin.user);
 
     const categoryResponse = await call('POST', '/products/categories', {
@@ -204,7 +219,7 @@ async function main(): Promise<void> {
     /* ── Wholesale gating ─────────────────────────────────────────────── */
     section('Wholesale approval gate (PRD 4.1 / 4.7)');
 
-    const wholesale = await login('+919812345672', 'wholesale');
+    const wholesale = await login('user9812345672', 'wholesale');
     check(
       'wholesale signup starts pending',
       wholesale.user.wholesaleStatus === 'pending',
@@ -252,8 +267,9 @@ async function main(): Promise<void> {
     /* ── Staff pricing guard ──────────────────────────────────────────── */
     section('Staff vs admin permissions (PRD 8.9)');
 
-    await User.create({ phone: '+919812345673', accountType: 'staff' });
-    const staff = await login('+919812345673');
+    const staffSeed = await login('staff');
+    await User.updateOne({ email: staffSeed.email }, { $set: { accountType: 'staff' } });
+    const staff = await login('user9812345673');
     check('staff account type resolved', staff.user.accountType === 'staff', staff.user);
 
     const staffPriceChange = await call('PATCH', `/products/${productId}`, {
@@ -350,7 +366,7 @@ async function main(): Promise<void> {
     /* ── Order lifecycle ──────────────────────────────────────────────── */
     section('Order lifecycle (PRD 4.5)');
 
-    const otherUser = await login('+919812345674');
+    const otherUser = await login('user9812345674');
     const crossRead = await call('GET', `/orders/${orderId}`, { token: otherUser.accessToken });
     check('a customer cannot read another customer\'s order', crossRead.status === 404, crossRead.body);
 
@@ -420,6 +436,104 @@ async function main(): Promise<void> {
       'an out-of-range quantity is rejected by validation before the controller',
       overValidator.status === 422,
       overValidator.body,
+    );
+
+    /* ── Buy now ──────────────────────────────────────────────────────── */
+    section('Buy now — one product, cart untouched');
+
+    // The client refuses to place a Buy-now order unless the server says it
+    // understands the field, because an older server would strip it and bill
+    // the whole cart with no visible error.
+    const buyNowConfig = await call('GET', '/config', { token: retail.accessToken });
+    check(
+      'config advertises Buy-now support',
+      buyNowConfig.body.data?.buyNowSupported === true,
+      buyNowConfig.body.data,
+    );
+
+    // A cart that has to survive the Buy-now order completely unchanged. This
+    // is the whole point of the feature: without it, "Buy now" would bill the
+    // customer for everything they had saved.
+    await call('POST', '/cart/items', {
+      token: retail.accessToken,
+      body: { productId, quantity: 2 },
+    });
+    const cartBeforeBuyNow = await call('GET', '/cart', { token: retail.accessToken });
+    check(
+      'the cart holds 2 pieces before Buy now',
+      cartBeforeBuyNow.body.data?.itemCount === 2,
+      cartBeforeBuyNow.body.data,
+    );
+
+    // Read live rather than hardcoded: an earlier section repriced this product.
+    const productBeforeBuyNow = await Product.findById(productId);
+    const stockBeforeBuyNow = productBeforeBuyNow?.stock ?? 0;
+    const buyNowUnitPrice = productBeforeBuyNow?.retailPrice ?? 0;
+
+    const buyNowOrder = await call('POST', '/orders/checkout', {
+      token: retail.accessToken,
+      body: { addressId, paymentMethod: 'cod', buyNow: { productId, quantity: 1 } },
+    });
+    check('Buy now checkout succeeds', buyNowOrder.status === 201, buyNowOrder.body);
+    check(
+      'the order holds only the bought product, at the bought quantity',
+      buyNowOrder.body.data?.order?.items?.length === 1 &&
+        buyNowOrder.body.data?.order?.items?.[0]?.quantity === 1,
+      buyNowOrder.body.data?.order?.items,
+    );
+    check(
+      'the total is that one line plus shipping, not the cart',
+      buyNowOrder.body.data?.order?.totalAmount === buyNowUnitPrice + 5000,
+      buyNowOrder.body.data?.order,
+    );
+    check(
+      'the order is flagged fromBuyNow so payment does not clear the cart',
+      buyNowOrder.body.data?.order?.fromBuyNow === true,
+      buyNowOrder.body.data?.order,
+    );
+
+    const cartAfterBuyNow = await call('GET', '/cart', { token: retail.accessToken });
+    check(
+      'the saved cart is untouched by a Buy-now order',
+      cartAfterBuyNow.body.data?.itemCount === 2,
+      cartAfterBuyNow.body.data,
+    );
+
+    const stockAfterBuyNow = (await Product.findById(productId))?.stock ?? 0;
+    check('stock falls by the bought quantity only', stockAfterBuyNow === stockBeforeBuyNow - 1, {
+      before: stockBeforeBuyNow,
+      after: stockAfterBuyNow,
+    });
+
+    const buyNowOverStock = await call('POST', '/orders/checkout', {
+      token: retail.accessToken,
+      body: { addressId, paymentMethod: 'cod', buyNow: { productId, quantity: 900 } },
+    });
+    check(
+      'Buy now cannot order more than the available stock',
+      buyNowOverStock.status === 409,
+      buyNowOverStock.body,
+    );
+
+    const buyNowUnknown = await call('POST', '/orders/checkout', {
+      token: retail.accessToken,
+      body: {
+        addressId,
+        paymentMethod: 'cod',
+        buyNow: { productId: '0123456789abcdef01234567', quantity: 1 },
+      },
+    });
+    check(
+      'Buy now on a product that does not exist is refused',
+      buyNowUnknown.status === 409,
+      buyNowUnknown.body,
+    );
+
+    const stockAfterFailures = (await Product.findById(productId))?.stock ?? 0;
+    check(
+      'a refused Buy now reserves no stock',
+      stockAfterFailures === stockAfterBuyNow,
+      { expected: stockAfterBuyNow, got: stockAfterFailures },
     );
 
     /* ── Session persistence ──────────────────────────────────────────── */
